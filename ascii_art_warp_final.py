@@ -718,7 +718,7 @@ _writer_thread = None
 _writer_out = None   # cv2.VideoWriter 实例在同一进程，直接引用不用队列传
 
 
-def _compress_video_ffmpeg(input_path, output_path, crf=23, preset="medium"):
+def _compress_video_ffmpeg(input_path, output_path, crf=23, preset="medium", progress_callback=None):
     """使用 ffmpeg 压缩视频
     
     Args:
@@ -726,25 +726,69 @@ def _compress_video_ffmpeg(input_path, output_path, crf=23, preset="medium"):
         output_path: 输出视频路径（压缩后）
         crf: 质量参数，0-51，越小质量越高（默认23）
         preset: 编码速度预设 ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+        progress_callback: 可选，进度回调 (current_sec, total_sec)
     """
     import subprocess
-    
+
+    # 获取视频时长
+    total_sec = 0
+    try:
+        probe = subprocess.run([
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', input_path
+        ], capture_output=True, text=True, timeout=30)
+        if probe.returncode == 0:
+            import json
+            info = json.loads(probe.stdout)
+            total_sec = float(info.get('format', {}).get('duration', 0))
+    except:
+        pass
+
     cmd = [
         'ffmpeg', '-y',
+        '-progress', 'pipe:1',   # 结构化进度输出到 stdout
+        '-nostats',               # 禁止 stderr 的默认进度行
+        '-loglevel', 'error',     # stderr 只输出错误
         '-i', input_path,
         '-c:v', 'libx264',
         '-preset', preset,
         '-crf', str(crf),
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',  # 如果有音频则编码
+        '-c:a', 'aac',
         '-b:a', '128k',
         output_path
     ]
-    
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            print(f"[WARN] ffmpeg 压缩失败: {result.stderr[-500:]}")
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True
+        )
+        # 解析 -progress pipe:1 的 key=value 输出
+        # 优先 out_time_us，其次 out_time_ms，最后解析 out_time=HH:MM:SS.xxx
+        for line in process.stdout:
+            line = line.strip()
+            if line.startswith('out_time_us='):
+                us = int(line.split('=', 1)[1])
+                if us > 0 and progress_callback:
+                    progress_callback(us / 1_000_000, total_sec if total_sec > 0 else 9999)
+            elif line.startswith('out_time_ms='):
+                ms_val = int(line.split('=', 1)[1])
+                if ms_val > 0 and progress_callback:
+                    progress_callback(ms_val / 1000, total_sec if total_sec > 0 else 9999)
+            elif line.startswith('out_time='):
+                try:
+                    ts = line.split('=', 1)[1]
+                    parts = ts.split(':')
+                    sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                    if sec > 0 and progress_callback:
+                        progress_callback(sec, total_sec if total_sec > 0 else 9999)
+                except:
+                    pass
+
+        process.wait()
+        if process.returncode != 0:
+            print(f"[WARN] ffmpeg 压缩失败: rc={process.returncode}")
             return False
         return True
     except FileNotFoundError:
@@ -773,7 +817,8 @@ def video_to_mkv_multiprocess(input_path, output_path, target_w, target_h, chars
                               bg_color_rgb, use_color, max_workers, buffer_size=30,
                               progress_callback=None, accel_mode="torch_cuda_single", gpu_id=0,
                               compress=False, crf=23, preset="medium",
-                              reduce_video=True):
+                              reduce_video=True,
+                              compress_progress_callback=None):
     global _writer_queue, _writer_active, _writer_thread
     _writer_queue = Queue(maxsize=buffer_size)
     _writer_active = True
@@ -920,7 +965,8 @@ def video_to_mkv_multiprocess(input_path, output_path, target_w, target_h, chars
         orig_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         print(f"[INFO] 开始 ffmpeg 压缩 (CRF={crf}, preset={preset})...")
         tmp_output = output_path + '.tmp_compress.mp4'
-        if _compress_video_ffmpeg(output_path, tmp_output, crf=crf, preset=preset):
+        if _compress_video_ffmpeg(output_path, tmp_output, crf=crf, preset=preset,
+                                  progress_callback=compress_progress_callback):
             try:
                 os.replace(tmp_output, output_path)
                 new_size = os.path.getsize(output_path)
@@ -1304,6 +1350,422 @@ def run_cli(args):
         traceback.print_exc()
         return 1
 
+
+class AsciiArtApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("字符画转换器（多进程 + GPU加速）")
+        self.root.geometry("1000x960")
+
+        self.file_path = None
+        self.processing = False
+        self.original_aspect = 1.0
+        self.original_width_px = 0
+        self.original_height_px = 0
+
+        system_font = get_system_monospace_font()
+        self.font_path_var = tk.StringVar(value=system_font if system_font else "Consolas.ttf")
+        self.bg_color_rgb = (0, 0, 0)
+
+        self.max_cpu_cores = mp.cpu_count()
+        self.cpu_cores_var = tk.IntVar(value=min(4, self.max_cpu_cores))
+
+        # GPU 相关
+        self.gpu_devices = _TORCH_DEVICES
+        self.accel_options = _ACCEL_OPTIONS
+        self.accel_mode = _ACCEL_CURRENT
+        self.selected_gpu_id = 0
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # ---- 硬件加速面板 ----
+        fgpu = tk.Frame(self.root, bg="#0d1117", bd=1, relief="solid")
+        fgpu.pack(fill="x", padx=10, pady=(10, 0))
+
+        hdr = tk.Frame(fgpu, bg="#0d1117")
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(hdr, text="🖥  硬件加速", fg="#e6edf3", bg="#0d1117",
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+
+        if self.gpu_devices:
+            gpu_info = "  |  ".join(f"[{d[0]}] {d[1]} ({d[2]}GB)" for d in self.gpu_devices)
+            tk.Label(hdr, text=f"检测到 {len(self.gpu_devices)} 台 GPU: {gpu_info}",
+                     fg="#58a6ff", bg="#0d1117", font=("Consolas", 8)).pack(side="right")
+        else:
+            tk.Label(hdr, text="未检测到 CUDA GPU", fg="#f0883e", bg="#0d1117",
+                     font=("Consolas", 8)).pack(side="right")
+
+        row1 = tk.Frame(fgpu, bg="#0d1117")
+        row1.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(row1, text="加速后端:", fg="#c9d1d9", bg="#0d1117").pack(side="left")
+
+        backend_vals = [o[1] for o in self.accel_options]
+        backend_map = {o[1]: (o[0], o[2]) for o in self.accel_options}
+
+        self.accel_var = tk.StringVar(value=backend_vals[0] if backend_vals else "")
+        self.accel_combo = ttk.Combobox(row1, textvariable=self.accel_var,
+                                        values=backend_vals, width=30, state="readonly")
+        self.accel_combo.pack(side="left", padx=(0, 10))
+        self.accel_combo.bind('<<ComboboxSelected>>', self._on_accel_changed)
+
+        first_desc = backend_map.get(backend_vals[0], ("", ""))[1]
+        self.accel_desc_var = tk.StringVar(value=first_desc)
+        tk.Label(row1, textvariable=self.accel_desc_var, fg="#8b949e", bg="#0d1117",
+                 font=("Segoe UI", 8)).pack(side="left")
+
+        row2 = tk.Frame(fgpu, bg="#0d1117")
+        row2.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(row2, text="使用显卡:", fg="#c9d1d9", bg="#0d1117").pack(side="left")
+
+        if self.gpu_devices:
+            gpu_vals = [f"[{d[0]}] {d[1]} ({d[2]}GB)" for d in self.gpu_devices]
+            self.gpu_var = tk.StringVar(value=gpu_vals[0])
+            self.gpu_combo = ttk.Combobox(row2, textvariable=self.gpu_var,
+                                          values=gpu_vals, width=30, state="readonly")
+            self.gpu_combo.pack(side="left", padx=(0, 10))
+            self.gpu_combo.bind('<<ComboboxSelected>>', self._on_gpu_changed)
+
+            if len(self.gpu_devices) == 1:
+                tk.Label(row2, text="(单卡模式，切换到 DataParallel 可用多卡)",
+                         fg="#6e7681", bg="#0d1117", font=("Segoe UI", 8)).pack(side="left")
+            else:
+                tk.Label(row2, text=f"(共 {len(self.gpu_devices)} 卡，DataParallel 自动轮询)",
+                         fg="#58a6ff", bg="#0d1117", font=("Segoe UI", 8)).pack(side="left")
+        else:
+            tk.Label(row2, text="无可用 GPU（将使用 CPU 加速）",
+                     fg="#f0883e", bg="#0d1117", font=("Segoe UI", 9)).pack(side="left")
+
+        self.gpu_status = tk.Label(fgpu, text=f"当前: {_ACCEL_MODE}",
+                                   fg="#3fb950", bg="#0d1117", font=("Consolas", 9))
+        self.gpu_status.pack(anchor="w", padx=10, pady=(0, 6))
+
+        # ---- 文件选择 ----
+        ffile = tk.LabelFrame(self.root, text="1. 选择媒体文件", padx=5, pady=5)
+        ffile.pack(fill="x", padx=10, pady=5)
+        tk.Button(ffile, text="打开图片/视频", command=self.select_file).pack(side="left", padx=5)
+        self.lbl_file = tk.Label(ffile, text="未选择", fg="gray")
+        self.lbl_file.pack(side="left", padx=5)
+        self.btn_preview = tk.Button(ffile, text="预览悬浮窗", command=self.open_preview, state="disabled")
+        self.btn_preview.pack(side="left", padx=20)
+
+        # ---- 分辨率 ----
+        fres = tk.LabelFrame(self.root, text="2. 输出分辨率（字符数）", padx=5, pady=5)
+        fres.pack(fill="x", padx=10, pady=5)
+        tk.Label(fres, text="宽度（列数）:").grid(row=0, column=0, sticky="w", padx=5)
+        self.width_var = tk.IntVar(value=80)
+        tk.Spinbox(fres, from_=20, to=500, textvariable=self.width_var, width=6,
+                   command=self.on_width_change).grid(row=0, column=1, sticky="w")
+        tk.Label(fres, text="高度（行数）:").grid(row=0, column=2, sticky="w", padx=5)
+        self.height_var = tk.IntVar(value=45)
+        tk.Spinbox(fres, from_=10, to=300, textvariable=self.height_var, width=6,
+                   command=self.on_height_change).grid(row=0, column=3, sticky="w")
+        self.lock_aspect = tk.BooleanVar(value=True)
+        tk.Checkbutton(fres, text="锁定宽高比", variable=self.lock_aspect).grid(
+            row=0, column=4, columnspan=2, sticky="w", padx=10)
+        self.lbl_suggestion = tk.Label(fres, text="建议分辨率：--", fg="gray")
+        self.lbl_suggestion.grid(row=1, column=0, columnspan=6, sticky="w", padx=5, pady=2)
+
+        # ---- 字符样式与性能 ----
+        fpar = tk.LabelFrame(self.root, text="3. 字符样式与性能", padx=5, pady=5)
+        fpar.pack(fill="x", padx=10, pady=5)
+
+        r = 0
+        tk.Label(fpar, text="字符集:").grid(row=r, column=0, sticky="w", padx=5)
+        self.charset_var = tk.StringVar(value=" .:-=+*#%@")
+        ttk.Combobox(fpar, textvariable=self.charset_var, values=(
+            " .:-=+*#%@",
+            " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
+            "01",
+            "@%#*+=-:. "
+        ), width=30).grid(row=r, column=1, sticky="w")
+        r += 1
+
+        tk.Label(fpar, text="字体:").grid(row=r, column=0, sticky="w", padx=5)
+        tk.Entry(fpar, textvariable=self.font_path_var, width=20).grid(row=r, column=1, sticky="w")
+        tk.Label(fpar, text="(等宽字体)").grid(row=r, column=2, columnspan=2, sticky="w")
+        r += 1
+
+        tk.Label(fpar, text="字号:").grid(row=r, column=0, sticky="w", padx=5)
+        self.fontsize_var = tk.IntVar(value=16)
+        tk.Spinbox(fpar, from_=8, to=48, textvariable=self.fontsize_var, width=6).grid(row=r, column=1, sticky="w")
+        r += 1
+
+        self.use_color_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(fpar, text="彩色输出（保留原图颜色）",
+                       variable=self.use_color_var).grid(row=r, column=0, columnspan=2, sticky="w", padx=5)
+        r += 1
+
+        tk.Label(fpar, text="CPU 进程数:").grid(row=r, column=0, sticky="w", padx=5)
+        self.cpu_spin = tk.Spinbox(fpar, from_=1, to=self.max_cpu_cores,
+                                    textvariable=self.cpu_cores_var, width=6)
+        self.cpu_spin.grid(row=r, column=1, sticky="w")
+        tk.Label(fpar, text=f"(本机最大 {self.max_cpu_cores} 核心)").grid(
+            row=r, column=2, columnspan=2, sticky="w")
+        r += 1
+
+        tk.Label(fpar, text="内存缓冲帧数:").grid(row=r, column=0, sticky="w", padx=5)
+        self.buffer_size_var = tk.IntVar(value=60)
+        tk.Spinbox(fpar, from_=5, to=200, textvariable=self.buffer_size_var, width=6).grid(row=r, column=1, sticky="w")
+        tk.Label(fpar, text="(调大可提升 GPU 利用率)").grid(row=r, column=2, columnspan=2, sticky="w")
+        r += 1
+
+        self.keep_audio_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(fpar, text="保留原视频音频（需要 ffmpeg）",
+                       variable=self.keep_audio_var).grid(row=r, column=0, columnspan=4, sticky="w", padx=5)
+        r += 1
+
+        self.reduce_video_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(fpar, text="预压缩视频（缩小到目标分辨率，减少处理量）",
+                       variable=self.reduce_video_var).grid(row=r, column=0, columnspan=4, sticky="w", padx=5)
+        r += 1
+
+        tk.Label(fpar, text="输出压缩强度:").grid(row=r, column=0, sticky="w", padx=5)
+        self.strength_var = tk.IntVar(value=5)
+        strength_scale = tk.Scale(fpar, from_=0, to=10, orient="horizontal", variable=self.strength_var,
+                                  length=200, resolution=1)
+        strength_scale.grid(row=r, column=1, columnspan=2, sticky="w")
+        self.lbl_strength = tk.Label(fpar, text="5 (平衡)", width=15)
+        self.lbl_strength.grid(row=r, column=3, sticky="w")
+        def _on_strength(v):
+            v = int(v)
+            if v == 0:
+                self.lbl_strength.config(text="0 (不压缩)")
+            elif v <= 3:
+                self.lbl_strength.config(text=f"{v} (轻压缩)")
+            elif v <= 7:
+                self.lbl_strength.config(text=f"{v} (平衡)")
+            else:
+                self.lbl_strength.config(text=f"{v} (强压缩)")
+        strength_scale.config(command=_on_strength)
+        r += 1
+
+        # ---- 转换按钮 & 进度 ----
+        tk.Frame(self.root).pack(fill="x", padx=10, pady=5)
+        self.btn_convert = tk.Button(self.root, text="开始转换", command=self.start_conversion,
+                                      bg="lightgreen", font=("Arial", 11))
+        self.btn_convert.pack(pady=5)
+
+
+        fprog = tk.Frame(self.root)
+        fprog.pack(fill="x", padx=10, pady=5)
+        self.progress = ttk.Progressbar(fprog, orient="horizontal", length=500, mode="determinate")
+        self.progress.pack(side="left", padx=5)
+        self.lbl_eta = tk.Label(fprog, text="ETA: --:--:--", width=15)
+        self.lbl_eta.pack(side="left", padx=10)
+        self.lbl_status = tk.Label(self.root, text="就绪", fg="blue")
+        self.lbl_status.pack(pady=5)
+
+    def _on_accel_changed(self, event=None):
+        label = self.accel_var.get()
+        for o in self.accel_options:
+            if o[1] == label:
+                self.accel_mode = o[0]
+                set_accel_mode(o[0])
+                self.accel_desc_var.set(o[2])
+                self.gpu_status.config(text=f"当前: {_ACCEL_MODE}")
+                if "CUDA" in _ACCEL_MODE:
+                    self.gpu_status.config(fg="#3fb950")
+                elif "CPU" in _ACCEL_MODE or "Numba" in _ACCEL_MODE:
+                    self.gpu_status.config(fg="#d29922")
+                else:
+                    self.gpu_status.config(fg="#8b949e")
+                break
+
+    def _on_gpu_changed(self, event=None):
+        try:
+            sel = self.gpu_var.get()
+            self.selected_gpu_id = int(sel.split(']')[0].split('[')[1])
+        except:
+            self.selected_gpu_id = 0
+
+    def select_file(self):
+        path = filedialog.askopenfilename(title="选择图片或视频", filetypes=[
+            ("所有支持", "*.jpg *.jpeg *.png *.bmp *.gif *.mp4 *.avi *.mov *.mkv *.flv")])
+        if path:
+            self.file_path = path
+            self.lbl_file.config(text=os.path.basename(path), fg="black")
+            self.btn_preview.config(state="normal")
+            self.get_original_dimensions(path)
+            self.update_suggestion()
+
+    def get_original_dimensions(self, filepath):
+        ext = os.path.splitext(filepath)[1].lower()
+        try:
+            if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif']:
+                with Image.open(filepath) as img:
+                    self.original_width_px, self.original_height_px = img.size
+            else:
+                cap = cv2.VideoCapture(filepath)
+                if cap.isOpened():
+                    self.original_width_px = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    self.original_height_px = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
+                else:
+                    self.original_width_px, self.original_height_px = 1920, 1080
+            self.original_aspect = self.original_width_px / self.original_height_px
+        except:
+            self.original_width_px, self.original_height_px = 1920, 1080
+            self.original_aspect = 16/9
+
+    def update_suggestion(self):
+        if self.original_aspect > 0:
+            w = self.width_var.get()
+            h = int(w / self.original_aspect)
+            h = max(10, min(300, h))
+            self.lbl_suggestion.config(text=f"建议分辨率（保持比例）：{w} x {h}")
+        else:
+            self.lbl_suggestion.config(text="建议分辨率：请先选择文件")
+
+    def on_width_change(self):
+        if self.lock_aspect.get() and self.original_aspect > 0:
+            w = self.width_var.get()
+            h = int(w / self.original_aspect)
+            h = max(10, min(300, h))
+            self.height_var.set(h)
+        self.update_suggestion()
+
+    def on_height_change(self):
+        if self.lock_aspect.get() and self.original_aspect > 0:
+            h = self.height_var.get()
+            w = int(h * self.original_aspect)
+            w = max(20, min(500, w))
+            self.width_var.set(w)
+        self.update_suggestion()
+
+    def open_preview(self):
+        if not self.file_path:
+            messagebox.showwarning("警告", "请先选择文件")
+            return
+        charset = self.charset_var.get()
+        if len(charset) < 2:
+            messagebox.showwarning("警告", "字符集至少需要 2 个字符")
+            return
+        PreviewWindow(self.root, self.file_path, self.width_var.get(), self.height_var.get(),
+                      charset, self.font_path_var.get(), self.fontsize_var.get(),
+                      self.bg_color_rgb, self.use_color_var.get())
+
+    def start_conversion(self):
+        if not self.file_path:
+            messagebox.showwarning("警告", "请先选择文件")
+            return
+        charset = self.charset_var.get()
+        if len(charset) < 2:
+            messagebox.showwarning("警告", "字符集至少需要 2 个字符")
+            return
+        if self.processing:
+            return
+
+        ext = os.path.splitext(self.file_path)[1].lower()
+        is_video = ext in ['.mp4', '.avi', '.mov', '.mkv', '.flv']
+
+        if is_video:
+            output_path = filedialog.asksaveasfilename(defaultextension=".mkv", filetypes=[("MKV 视频", "*.mkv")])
+        else:
+            output_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG 图片", "*.png")])
+
+        if not output_path:
+            return
+
+        self.processing = True
+        self.btn_convert.config(state="disabled")
+        self.progress["value"] = 0
+        self.lbl_eta.config(text="ETA: --:--:--")
+        self.lbl_status.config(text="转换中...")
+
+        target_w = self.width_var.get()
+        target_h = self.height_var.get()
+        max_workers = min(self.cpu_cores_var.get(), self.max_cpu_cores)
+        buffer_size = self.buffer_size_var.get()
+        font_path_abs = os.path.abspath(self.font_path_var.get())
+
+        def update_progress(current, total, eta_str):
+            self.root.after(0, lambda: self.progress.config(maximum=total, value=current))
+            self.root.after(0, lambda: self.lbl_eta.config(text=f"ETA: {eta_str}"))
+            self.root.after(0, lambda: self.lbl_status.config(text=f"处理 {current}/{total}"))
+            self.root.after(0, lambda: self.root.update_idletasks())
+
+        def update_compress_progress(current_sec, total_sec):
+            pct = min(int(current_sec / total_sec * 100), 99) if total_sec > 0 else 0
+            self.root.after(0, lambda crs=current_sec, trs=total_sec, p=pct: [
+                self.progress.configure(maximum=100, value=p),
+                self.lbl_eta.config(text=""),
+                self.lbl_status.config(text=f"压缩中... {crs:.0f}s/{trs:.0f}s ({p}%)")
+            ])
+
+        def worker():
+            temp_video = None
+            try:
+                if is_video:
+                    temp_dir = os.path.dirname(output_path) or "."
+                    temp_video = os.path.join(temp_dir, "_temp_no_audio.mp4")
+                    total = video_to_mkv_multiprocess(
+                        input_path=self.file_path, output_path=temp_video,
+                        target_w=target_w, target_h=target_h, charset=charset,
+                        font_path=font_path_abs, font_size=self.fontsize_var.get(),
+                        bg_color_rgb=self.bg_color_rgb, use_color=self.use_color_var.get(),
+                        max_workers=max_workers, buffer_size=buffer_size,
+                        progress_callback=update_progress,
+                        accel_mode=self.accel_mode, gpu_id=self.selected_gpu_id,
+                        reduce_video=self.reduce_video_var.get(),
+                        compress=self.strength_var.get() > 0,
+                        crf=16 + self.strength_var.get() * 2 if self.strength_var.get() > 0 else 23,
+                        compress_progress_callback=update_compress_progress)
+
+                    if self.keep_audio_var.get():
+                        self.root.after(0, lambda: self.lbl_status.config(text="正在合并音频..."))
+                        ok, msg = merge_audio(temp_video, self.file_path, output_path)
+                        if ok:
+                            try:
+                                os.remove(temp_video)
+                            except:
+                                pass
+                            self.root.after(0, lambda: messagebox.showinfo("完成",
+                                f"视频转换完成！共 {total} 帧\n已保留原音频\n保存至：{output_path}"))
+                        else:
+                            if os.path.exists(temp_video):
+                                try:
+                                    os.rename(temp_video, output_path)
+                                except:
+                                    pass
+                            if "没有音轨" in msg:
+                                self.root.after(0, lambda: messagebox.showinfo("完成",
+                                    f"视频转换完成！共 {total} 帧\n原视频无音轨\n保存至：{output_path}"))
+                            elif "未安装" in msg:
+                                self.root.after(0, lambda: messagebox.showwarning("警告",
+                                    f"音频合并失败：{msg}"))
+                            else:
+                                self.root.after(0, lambda: messagebox.showwarning("警告",
+                                    f"音频合并失败：{msg}\n输出视频无音频"))
+                    else:
+                        if os.path.exists(temp_video):
+                            os.rename(temp_video, output_path)
+                        self.root.after(0, lambda: messagebox.showinfo("完成",
+                            f"视频转换完成！共 {total} 帧\n保存至：{output_path}"))
+                else:
+                    image_to_image(input_path=self.file_path, output_path=output_path,
+                                   target_w=target_w, target_h=target_h, charset=charset,
+                                   font_path=font_path_abs, font_size=self.fontsize_var.get(),
+                                   bg_color_rgb=self.bg_color_rgb, use_color=self.use_color_var.get())
+                    self.root.after(0, lambda: messagebox.showinfo("完成",
+                        f"图片转换完成\n保存至：{output_path}"))
+
+                self.root.after(0, lambda: self.lbl_status.config(text="转换完成"))
+                self.root.after(0, lambda: self.lbl_eta.config(text="ETA: 00:00:00"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+                self.root.after(0, lambda: self.lbl_status.config(text="转换失败"))
+                if temp_video and os.path.exists(temp_video):
+                    try:
+                        os.remove(temp_video)
+                    except:
+                        pass
+            finally:
+                self.root.after(0, lambda: setattr(self, 'processing', False))
+                self.root.after(0, lambda: self.btn_convert.config(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
 if __name__ == "__main__":
     import argparse
