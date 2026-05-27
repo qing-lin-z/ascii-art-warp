@@ -769,11 +769,17 @@ def _compress_video_ffmpeg(input_path, output_path, crf=23, preset="medium", pro
         for line in process.stdout:
             line = line.strip()
             if line.startswith('out_time_us='):
-                us = int(line.split('=', 1)[1])
+                try:
+                    us = int(line.split('=', 1)[1])
+                except ValueError:
+                    continue
                 if us > 0 and progress_callback:
                     progress_callback(us / 1_000_000, total_sec if total_sec > 0 else 9999)
             elif line.startswith('out_time_ms='):
-                ms_val = int(line.split('=', 1)[1])
+                try:
+                    ms_val = int(line.split('=', 1)[1])
+                except ValueError:
+                    continue
                 if ms_val > 0 and progress_callback:
                     progress_callback(ms_val / 1000, total_sec if total_sec > 0 else 9999)
             elif line.startswith('out_time='):
