@@ -41,17 +41,24 @@
 ### macOS / Linux 手动安装
 
 ```bash
-# 1. 安装依赖
+# 1. 安装系统依赖
+# macOS:     xcode-select --install
+# Ubuntu:    sudo apt install python3 python3-pip python3-tk ffmpeg
+# Arch:      sudo pacman -S python python-pip tk ffmpeg
+# Fedora:    sudo dnf install python3 python3-pip python3-tkinter ffmpeg
+
+# 2. 安装 Python 包
 pip install numpy opencv-python pillow pygame
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124  # GPU 加速（如有 NVIDIA 显卡）
 
-# 2. 安装 ffmpeg
-# macOS: brew install ffmpeg
-# Ubuntu: sudo apt install ffmpeg
+# 3. GPU 加速（如有 NVIDIA 显卡）
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
-# 3. 运行（GUI 模式）
+# 4. 运行（GUI 模式）
 python ascii_art_warp_final.py
 ```
+
+> **注意**：Linux 上 GUI 模式需要 `python3-tk` 包。如果运行时报 `tkinter` 找不到，请安装对应发行版的 Tkinter 包。
+> 默认字体 Consolas 仅 Windows 自带，Linux/macOS 会自动降级到系统等宽字体（如 DejaVu Sans Mono）。
 
 ## 使用指南
 
@@ -140,7 +147,7 @@ python ascii_art_warp_final.py --watch -i input.mp4 --color
 
 ```
 ascii-art-warp/
-+-- ascii_art_warp_final.py   # 主程序
++-- ascii_art_warp_final.py   # 主程序（跨平台）
 +-- install.bat               # Windows 一键安装脚本
 +-- README.md                 # 本文件
 +-- LICENSE                   # MIT 许可证
@@ -161,6 +168,16 @@ ascii-art-warp/
 
 - torch + torchvision (CUDA 版)
 - NVIDIA 显卡 + CUDA 11.8+
+
+### Linux 额外依赖
+
+```bash
+# Debian/Ubuntu
+sudo apt install python3-tk ffmpeg
+
+# Arch Linux
+sudo pacman -S tk ffmpeg
+```
 
 ## 致谢
 
@@ -185,9 +202,17 @@ A: 使用 `--exposure 1.6` 提高曝光度，或在 GUI 中调整「曝光度」
 
 A: 确保安装了 CUDA 版 PyTorch。`install.bat` 会自动检测并选择合适版本。
 
+**Q: Linux 上 tkinter 报错？**
+
+A: 安装 Tkinter 包：Ubuntu `sudo apt install python3-tk`、Arch `sudo pacman -S tk`、Fedora `sudo dnf install python3-tkinter`。
+
 **Q: 终端播放（--watch）颜色不对？**
 
-A: 确保终端支持 ANSI 24-bit 真彩色（Windows Terminal / VSCode 终端 / iTerm2 均支持）。
+A: 确保终端支持 ANSI 24-bit 真彩色（Windows Terminal / VSCode 终端 / iTerm2 / GNOME Terminal 均支持）。
+
+**Q: 找不到字体？**
+
+A: 程序会自动降级到系统等宽字体（macOS: Monaco, Linux: DejaVu Sans Mono）。也可通过 `--font` 指定具体 TTF 字体路径。
 
 ## License
 
