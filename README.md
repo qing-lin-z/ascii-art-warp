@@ -162,6 +162,19 @@ ascii-art-warp/
 - torch + torchvision (CUDA 版)
 - NVIDIA 显卡 + CUDA 11.8+
 
+## 致谢
+
+本项目基于 [image2textart](https://github.com/WindowGenerator/image2textart)（作者：WindowGenerator）二次开发，在原项目基础上新增了 GPU 加速渲染、帧批处理调度、视频压缩、GUI/CLI/终端播放等完整功能。
+
+感谢以下开源项目为本项目提供的技术支撑：
+
+- **[FFmpeg](https://ffmpeg.org/)** — 视频编码与压缩引擎（LGPL/GPL 许可）
+- **[PyTorch](https://pytorch.org/)** — GPU 加速计算框架（BSD 许可）
+- **[OpenCV](https://opencv.org/)** — 视频帧读取与图像处理（Apache 2.0 许可）
+- **[Pillow](https://python-pillow.org/)** — 字体渲染与图像处理（Historical Permission Notice）
+- **[NumPy](https://numpy.org/)** — 向量化数值计算（BSD 许可）
+- **[pygame](https://www.pygame.org/)** — GUI 界面框架（LGPL 许可）
+
 ## 常见问题
 
 **Q: 导出视频颜色偏暗？**
@@ -178,4 +191,4 @@ A: 确保终端支持 ANSI 24-bit 真彩色（Windows Terminal / VSCode 终端 /
 
 ## License
 
-MIT License
+MIT License — 基于 [image2textart](https://github.com/WindowGenerator/image2textart)
