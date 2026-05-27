@@ -6,14 +6,14 @@ setlocal enabledelayedexpansion
 :: ============================================================
 :: ASCII Art Warp - 一键安装脚本
 :: ============================================================
-:: 自动安装 Python 依赖、ffmpeg 并克隆项目源码
+:: 自动安装 Python 依赖和 ffmpeg
 :: ============================================================
 
 set SCRIPT_DIR=%~dp0
 set SCRIPT_FILE=ascii_art_warp_final.py
 set REPO_URL=https://github.com/qing-lin-z/ascii-art-warp
 
-:: === 检测 Python ===
+:: === 检查 Python ===
 call :check_python
 if %ERRORLEVEL% neq 0 (
     echo [错误] 未检测到 Python
@@ -25,7 +25,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-:: === 检测 pip ===
+:: === 检查 pip ===
 python -m pip --version >nul 2>nul
 if %ERRORLEVEL% neq 0 (
     echo [错误] pip 不可用，尝试安装...
@@ -38,7 +38,7 @@ if %ERRORLEVEL% neq 0 (
 
 echo.
 echo =============================================
-echo    ASCII Art Warp - 环境安装
+echo    ASCII Art Warp - 一键安装
 echo =============================================
 echo.
 
@@ -67,7 +67,7 @@ if %ERRORLEVEL% equ 0 (
     if !ERRORLEVEL! equ 0 (
         echo   CUDA 版安装成功！GPU 加速可用
     ) else (
-        echo   CUDA 版安装失败，回退到 CPU 版...
+        echo   CUDA 版安装失败，降级到 CPU 版...
         python -m pip install torch torchvision --user --quiet
     )
 ) else (
@@ -78,9 +78,9 @@ echo   完成
 echo.
 
 :: ============================================================
-:: 步骤 3: 安装可选加速依赖
+:: 步骤 3: 安装可选加速库
 :: ============================================================
-echo [3/4] 安装可选加速依赖 (numba, moviepy)...
+echo [3/4] 安装可选加速库 (numba, moviepy)...
 python -m pip install numba moviepy --user --quiet 2>nul
 echo   完成
 echo.
@@ -96,7 +96,7 @@ if %ERRORLEVEL% equ 0 (
     echo   已安装: !FFMPEG_VER!
 ) else (
     echo   [警告] 未检测到 ffmpeg
-    echo   视频导出功能需要 ffmpeg
+    echo   视频编码功能需要 ffmpeg
     echo.
     echo   下载地址: https://ffmpeg.org/download.html
     echo   或使用包管理器: winget install ffmpeg

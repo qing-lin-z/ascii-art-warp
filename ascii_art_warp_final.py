@@ -586,7 +586,10 @@ def process_frame_batch(frames):
     gray_list, color_list = [], []
     pil_list = []
     for f in frames:
-        f_r = cv2.resize(f, (tw, th))
+        if f.shape[1] != tw or f.shape[0] != th:
+            f_r = cv2.resize(f, (tw, th))
+        else:
+            f_r = f
         f_rgb = cv2.cvtColor(f_r, cv2.COLOR_BGR2RGB)
         pil_list.append(Image.fromarray(f_rgb))
         gray_list.append(np.array(pil_list[-1].convert("L"), dtype=np.uint8))
@@ -667,7 +670,11 @@ def process_frame(args):
     char_height = max(1, bbox[3] - bbox[1])
     char_dims = (char_width, char_height)
 
-    frame_resized = cv2.resize(frame_bgr, (target_w, target_h))
+    # 如果生产者已缩小帧（reduce_video=True），跳过重复 resize
+    if frame_bgr.shape[1] != target_w or frame_bgr.shape[0] != target_h:
+        frame_resized = cv2.resize(frame_bgr, (target_w, target_h))
+    else:
+        frame_resized = frame_bgr
     frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(frame_rgb)
 
@@ -682,7 +689,12 @@ def process_frame(args):
     return cv2.cvtColor(np.array(ascii_img), cv2.COLOR_RGB2BGR)
 
 # ========================== 生产者函数 ==========================
-def producer_func(input_path, frame_queue, done_event, buffer_size):
+def producer_func(input_path, frame_queue, done_event, buffer_size, reduce_video=False, target_dim=None):
+    """
+    生产者：读取视频帧放入队列。
+    reduce_video=True 时，在放入队列前缩小帧到 target_dim（目标 ASCII 分辨率），
+    大幅减少进程间传输的数据量。
+    """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         done_event.set()
@@ -692,6 +704,8 @@ def producer_func(input_path, frame_queue, done_event, buffer_size):
         ret, frame = cap.read()
         if not ret:
             break
+        if reduce_video and target_dim:
+            frame = cv2.resize(frame, target_dim, interpolation=cv2.INTER_AREA)
         frame_queue.put((idx, frame))
         idx += 1
     cap.release()
@@ -758,7 +772,8 @@ def _writer_loop():
 def video_to_mkv_multiprocess(input_path, output_path, target_w, target_h, charset, font_path, font_size,
                               bg_color_rgb, use_color, max_workers, buffer_size=30,
                               progress_callback=None, accel_mode="torch_cuda_single", gpu_id=0,
-                              compress=False, crf=23, preset="medium"):
+                              compress=False, crf=23, preset="medium",
+                              reduce_video=True):
     global _writer_queue, _writer_active, _writer_thread
     _writer_queue = Queue(maxsize=buffer_size)
     _writer_active = True
@@ -814,7 +829,8 @@ def video_to_mkv_multiprocess(input_path, output_path, target_w, target_h, chars
     frame_queue = mp.Queue(maxsize=buffer_size)
     done_event = mp.Event()
 
-    producer_args = (input_path, frame_queue, done_event, buffer_size)
+    producer_args = (input_path, frame_queue, done_event, buffer_size,
+                     reduce_video, (target_w, target_h) if reduce_video else None)
     producer_process = mp.Process(target=producer_func, args=producer_args, daemon=True)
     producer_process.start()
 
@@ -1281,6 +1297,11 @@ class AsciiArtApp:
                        variable=self.keep_audio_var).grid(row=r, column=0, columnspan=4, sticky="w", padx=5)
         r += 1
 
+        self.reduce_video_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(fpar, text="缩小视频再处理（大幅减少内存）",
+                       variable=self.reduce_video_var).grid(row=r, column=0, columnspan=4, sticky="w", padx=5)
+        r += 1
+
         tk.Label(fpar, text="背景色:").grid(row=r, column=0, sticky="w", padx=5)
         self.bg_color_display = tk.Label(fpar, text="黑色", bg="black", width=6, relief="sunken")
         self.bg_color_display.grid(row=r, column=1, sticky="w")
@@ -1500,7 +1521,7 @@ class AsciiArtApp:
                             f"视频转换完成！共 {total} 帧\n保存至：{output_path}"))
                 else:
                     image_to_image(input_path=self.file_path, output_path=output_path,
-                                   target_w=target_w, target_h=target_h, charset=charset,
+                                   target_w=target_w, target_h=target_h, charset=charset, reduce_video=self.reduce_video_var.get(),
                                    font_path=font_path_abs, font_size=self.fontsize_var.get(),
                                    bg_color_rgb=self.bg_color_rgb, use_color=self.use_color_var.get())
                     self.root.after(0, lambda: messagebox.showinfo("完成",
@@ -1524,7 +1545,7 @@ class AsciiArtApp:
         threading.Thread(target=worker, daemon=True).start()
 
 def watch_video(input_path, target_w, target_h, charset, font_path, font_size,
-              use_color, accel_mode, gpu_id):
+              use_color, accel_mode, gpu_id, reduce_video=True):
     """命令行模式：在终端实时播放 ASCII 艺术视频"""
     import os
     import sys
@@ -1738,6 +1759,7 @@ def run_cli(args):
             crf=args.crf,
             accel_mode=args.accel,
             gpu_id=args.gpu_id,
+            reduce_video=args.reduce_video,
             progress_callback=progress
         )
         elapsed = time.time() - start_time
@@ -1804,6 +1826,8 @@ if __name__ == "__main__":
                        choices=['torch_cuda_single', 'torch_cuda_dataparallel', 'torch_cpu', 'numba_parallel', 'numpy_vectorized'],
                        help='加速模式')
     parser.add_argument('--max-workers', type=int, default=4, help='CPU worker数量')
+    parser.add_argument('--reduce-video', action='store_true', default=True, help='预处理缩小视频，减少内存占用和进程间传输带宽')
+    parser.add_argument('--no-reduce-video', dest='reduce_video', action='store_false', help='不缩小视频，保持原始帧尺寸')
     parser.add_argument('--gpu-id', type=int, default=0, help='GPU设备ID')
 
     args = parser.parse_args()
@@ -1831,7 +1855,8 @@ if __name__ == "__main__":
             font_size=args.font_size,
             use_color=args.color,
             accel_mode=args.accel,
-            gpu_id=args.gpu_id
+            gpu_id=args.gpu_id,
+            reduce_video=args.reduce_video
         ))
 
     # CLI 模式
