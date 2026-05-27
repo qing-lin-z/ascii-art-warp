@@ -1312,11 +1312,12 @@ def run_cli(args):
     frame_count = [0]
     last_update = [time.time()]
 
-    def progress(current, total, fps):
+    def progress(current, total, eta_str):
         frame_count[0] = current
         elapsed = time.time() - last_update[0]
         if elapsed >= 1.0:
-            print(f'\r进度: {current}/{total} 帧 | {fps:.1f} FPS | {current*100//total}%', end='', flush=True)
+            pct = min(100, current * 100 // max(1, total))
+            print(f'\r进度: {current}/{total} 帧 | {pct}% | ETA {eta_str}', end='', flush=True)
             last_update[0] = time.time()
 
     try:
@@ -1328,6 +1329,7 @@ def run_cli(args):
             charset=' .:-=+*#%@',
             font_path=args.font,
             font_size=args.font_size,
+            bg_color_rgb=(0, 0, 0),
             use_color=args.color,
             max_workers=args.max_workers,
             compress=args.compress,
@@ -1339,9 +1341,9 @@ def run_cli(args):
         )
         elapsed = time.time() - start_time
         print(f'\n\n\033[92m转换完成！\033[0m')
-        print(f'总帧数: {result["frame_count"]}')
+        print(f'总帧数: {result}')
         print(f'耗时: {elapsed:.1f} 秒')
-        print(f'平均: {result["frame_count"]/elapsed:.1f} FPS')
+        print(f'平均: {result/elapsed:.1f} FPS')
         print(f'输出: {output_path}')
         return 0
     except Exception as e:
